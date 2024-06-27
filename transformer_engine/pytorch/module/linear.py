@@ -48,7 +48,10 @@ from ..jit import no_torch_dynamo
 from ..graph import is_graph_capturing
 from ..float8_tensor import Float8Tensor
 
+from .tools import linear_bf16_forward, compute_similarity
+
 _NVTE_DEBUG = int(os.getenv("NVTE_DEBUG", "0"))
+_FP8_DEBUG = int(os.getenv("FP8_DEBUG", "0"))
 
 __all__ = ["Linear"]
 
@@ -88,7 +91,7 @@ class _Linear(torch.autograd.Function):
         is_first_module_in_mha: bool,
     ) -> torch.Tensor:
         is_input_fp8 = isinstance(inp, Float8Tensor)
-        if is_input_fp8:
+        if is_input_fp8:  # False
             fp8_meta["scaling_fwd"].scale_inv[tex.FP8FwdTensors.GEMM1_INPUT] = inp._scale_inv[0]
 
         # Make sure input dimensions are compatible
@@ -152,7 +155,17 @@ class _Linear(torch.autograd.Function):
             inputmat_total, _ = gather_along_first_dim(inputmat, tp_group)
         else:
             inputmat_total = inputmat
+
         if fp8:
+            # JQ: additional bf16 gemm -------------------
+            out_bf16 = linear_bf16_forward(
+                         weight,
+                         bias,
+                         use_bias,
+                         activation_dtype,
+                         inputmat_no_fp8)
+            # JQ: additional bf16 gemm -------------------
+
             if _NVTE_DEBUG:
                 print('[Linear]: using FP8 forward')
 
@@ -265,6 +278,11 @@ class _Linear(torch.autograd.Function):
                     fp8_dtype=fp8_dtype_forward,
                     dtype=activation_dtype,
                 )
+
+            # JQ: fp8 vs. bf16 -------------------------------------------
+            cos, dot = compute_similarity(out_bf16.view(-1), out.view(-1))
+            # JQ: fp8 vs. bf16 -------------------------------------------
+
         else:
             if _NVTE_DEBUG:
                 print('[Linear]: using non-FP8 forward')
@@ -311,6 +329,20 @@ class _Linear(torch.autograd.Function):
                 ub=ub_obj_projout if ub_overlap_rs else None,
                 extra_output_tensor=rs_out if ub_overlap_rs else None,
             )
+
+            # JQ: fp8 gemm
+#             out_fp8 = linear_fp8_forward(
+#                         fp8_meta,
+#                         is_grad_enabled,
+#                         weight,
+#                         sequence_parallel,
+#                         inputmat=inputmat_total,
+#                         update_fp8_weights,
+#                         weight_fp8,
+#                         weight_t_fp8,
+#                         activation_dtype,
+#                         bias,
+#                         use_bias)
 
         if is_grad_enabled:
             saved_inputmat = None
@@ -373,8 +405,12 @@ class _Linear(torch.autograd.Function):
         if ub_overlap_rs:
             out = rs_out
         elif parallel_mode == "row" and sequence_parallel:
+            if _NVTE_DEBUG:
+                print('[Linear]: parallel mode is row and seq parallel')
             out, _ = reduce_scatter_along_first_dim(out, tp_group)
         elif parallel_mode == "row" and tensor_parallel:
+            if _NVTE_DEBUG:
+                print('[Linear]: parallel mode is row and tensor parallel')
             out, _ = allreduce(out, tp_group)
 
         # [*, in_features] -> [*, out_features] except first dimension changes for SP
