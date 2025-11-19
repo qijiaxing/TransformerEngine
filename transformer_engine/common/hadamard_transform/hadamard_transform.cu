@@ -201,7 +201,11 @@ template <typename IType, int kHadamardDimension, int BUFF_DIM_Y, int BUFF_DIM_X
 __device__ __forceinline__ void ComputeKernel(uint32_t b_frag_i[4], uint32_t b_frag_t[4],
                                               IType* in_sh_ptr, uint32_t& local_pre_rht_amax_reg,
                                               uint32_t& local_amax_reg,
-                                              uint32_t& local_amax_t_reg) {
+                                              uint32_t& local_amax_t_reg,
+                                              IType* output_transpose_ptr = nullptr,
+                                              uint64_t output_stride = 0,
+                                              uint64_t global_row_offset = 0,
+                                              uint64_t global_col_offset = 0) {
   uint32_t a_frag[4];  // A matrix fragment
   uint32_t c_frag[4];  // Result fragment
 
@@ -227,7 +231,7 @@ __device__ __forceinline__ void ComputeKernel(uint32_t b_frag_i[4], uint32_t b_f
                  : "r"(local_amax_reg), "r"(temp_amax_reg));
   }
 
-  if (kReturnTransposedAmax) {
+  if (kReturnTransposedAmax || output_transpose_ptr != nullptr) {
     // TODO(Frank): This is not efficient, since we could directly load the
     // matrix in transposed layout.
     if (!kReturnIdentityAmax) {
@@ -243,13 +247,23 @@ __device__ __forceinline__ void ComputeKernel(uint32_t b_frag_i[4], uint32_t b_f
     mma_m16_n16_k16_b16_b16_b16_noacc<kReturnTransposedAmax>(
         a_frag[0], a_frag[2], a_frag[1], a_frag[3], b_frag_t[0], b_frag_t[1], b_frag_t[2],
         b_frag_t[3], c_frag[0], c_frag[1], c_frag[2], c_frag[3], temp_amax_t_reg);
-    asm volatile("max.xorsign.abs.bf16x2 %0, %1, %2;\n\t"
-                 : "=r"(local_amax_t_reg)
-                 : "r"(local_amax_t_reg), "r"(temp_amax_t_reg));
+    
+    if (kReturnTransposedAmax) {
+      asm volatile("max.xorsign.abs.bf16x2 %0, %1, %2;\n\t"
+                   : "=r"(local_amax_t_reg)
+                   : "r"(local_amax_t_reg), "r"(temp_amax_t_reg));
+    }
+    
+    if (output_transpose_ptr != nullptr) {
+      uint64_t global_offset = global_row_offset * output_stride + global_col_offset;
+      void* output_addr = reinterpret_cast<void*>(output_transpose_ptr + global_offset);
+      store_matrix_16x16_to_global<false>(c_frag[0], c_frag[1], c_frag[2], c_frag[3],
+                                          output_addr, output_stride);
+    }
   }
 
   if (kReturnPreRhtAmax) {
-    if (!kReturnIdentityAmax && !kReturnTransposedAmax) {
+    if (!kReturnIdentityAmax && !kReturnTransposedAmax && output_transpose_ptr == nullptr) {
       ldmatrix_x4_m8n8_shared_b16<false>(a_frag[0], a_frag[1], a_frag[2], a_frag[3],
                                          reinterpret_cast<uint4*>(in_sh_ptr) + swizzle_idx);
     }
@@ -356,6 +370,7 @@ __global__ void HadamardAmaxTmaKernel(const __grid_constant__ CUtensorMap tensor
                                       float* __restrict__ output_pre_rht_amax_ptr,
                                       float* __restrict__ output_identity_amax_ptr,
                                       float* __restrict__ output_transpose_amax_ptr,
+                                      IType* __restrict__ output_transpose_ptr,
                                       uint16_t random_sign_mask, uint16_t random_sign_mask_t,
                                       uint64_t num_rows, uint64_t row_length) {
 #if (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
@@ -460,12 +475,19 @@ __global__ void HadamardAmaxTmaKernel(const __grid_constant__ CUtensorMap tensor
 
 #pragma unroll
         for (size_t compute_stage_x = 0; compute_stage_x < compute_stage_x_num; compute_stage_x++) {
+          // Compute global offsets for output
+          const uint64_t global_row = input_block_offset_Y + stage_y * BUFF_DIM_Y + row_idx_offset;
+          const uint64_t global_col = input_block_offset_X + stage_x * BUFF_DIM_X +
+                                      (compute_stage_x * kHadamardDimension * (THREADS_PER_CHUNK / kThreadsPerWarp));
+          
           ComputeKernel<IType, kHadamardDimension, BUFF_DIM_Y, BUFF_DIM_X, kReturnPreRhtAmax,
                         kReturnIdentityAmax, kReturnTransposedAmax>(
               had_frag_i, had_frag_t,
               in_sh_ptr + in_row_offset +
                   (compute_stage_x * kHadamardDimension * (THREADS_PER_CHUNK / kThreadsPerWarp)),
-              local_pre_rht_amax_reg, local_amax_reg, local_amax_t_reg);
+              local_pre_rht_amax_reg, local_amax_reg, local_amax_t_reg,
+              output_transpose_ptr, row_length,
+              global_row, global_col);
         }
 
         // Ensure all threads have finished their computation before new data over-writes the shared
@@ -759,12 +781,15 @@ void hadamard_transform_amax(const Tensor& input_, Tensor& output_, uint16_t ran
   SimpleTensor output_identity_amax;
   SimpleTensor& output_transpose_amax = output_.columnwise_amax;
 
+  // Check data output tensors
+  SimpleTensor& output_transpose = output_.columnwise_data;
+
   // Check requested outputs
   const bool return_pre_rht_amax = output_pre_rht_amax.dptr != nullptr;
   const bool return_identity_amax = output_identity_amax.dptr != nullptr;
   const bool return_transposed_amax = output_transpose_amax.dptr != nullptr;
   if (!return_identity_amax && !return_transposed_amax &&
-      !return_pre_rht_amax) {  // Nothing to do/ill-defined behavior.
+      !return_pre_rht_amax && output_transpose.dptr == nullptr) {  // Nothing to do/ill-defined behavior.
     return;
   }
 
@@ -845,8 +870,9 @@ void hadamard_transform_amax(const Tensor& input_, Tensor& output_, uint16_t ran
               kernel<<<grid, block, shmem_bytes, stream>>>(
                   tensor_map_input, reinterpret_cast<float*>(output_pre_rht_amax.dptr),
                   reinterpret_cast<float*>(output_identity_amax.dptr),
-                  reinterpret_cast<float*>(output_transpose_amax.dptr), random_sign_mask,
-                  random_sign_mask_t, num_rows, row_length);)));
+                  reinterpret_cast<float*>(output_transpose_amax.dptr),
+                  reinterpret_cast<IType*>(output_transpose.dptr),
+                  random_sign_mask, random_sign_mask_t, num_rows, row_length););););
 
   NVTE_CHECK_CUDA(cudaGetLastError());
 #else
