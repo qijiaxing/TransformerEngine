@@ -198,12 +198,11 @@ __device__ __forceinline__ uint32_t swizzle_128B_atom_32B(uint32_t gmem_row_idx,
 
 template <typename IType, int kHadamardDimension, int BUFF_DIM_Y, int BUFF_DIM_X,
           bool kReturnPreRhtAmax, bool kReturnIdentityAmax, bool kReturnTransposedAmax,
-          bool kReturnIdentity, bool kReturnTransposed>
+          bool kReturnTransposed>
 __device__ __forceinline__ void ComputeKernel(uint32_t b_frag_i[4], uint32_t b_frag_t[4],
                                               IType* in_sh_ptr, uint32_t& local_pre_rht_amax_reg,
                                               uint32_t& local_amax_reg,
                                               uint32_t& local_amax_t_reg,
-                                              IType* output_identity_ptr = nullptr,
                                               IType* output_transpose_ptr = nullptr,
                                               uint64_t output_stride = 0,
                                               uint64_t global_row_offset = 0,
@@ -221,32 +220,22 @@ __device__ __forceinline__ void ComputeKernel(uint32_t b_frag_i[4], uint32_t b_f
   uint32_t temp_amax_reg;
   uint32_t temp_amax_t_reg;
 
-  if (kReturnIdentityAmax || kReturnIdentity) {
+  if (kReturnIdentityAmax) {
     ldmatrix_x4_m8n8_shared_b16<false>(a_frag[0], a_frag[1], a_frag[2], a_frag[3],
                                        reinterpret_cast<uint4*>(in_sh_ptr) + swizzle_idx);
 
     mma_m16_n16_k16_b16_b16_b16_noacc<kReturnIdentityAmax>(
         a_frag[0], a_frag[1], a_frag[2], a_frag[3], b_frag_i[0], b_frag_i[1], b_frag_i[2],
         b_frag_i[3], c_frag[0], c_frag[1], c_frag[2], c_frag[3], temp_amax_reg);
-    
-    if (kReturnIdentityAmax) {
-      asm volatile("max.xorsign.abs.bf16x2 %0, %1, %2;\n\t"
-                   : "=r"(local_amax_reg)
-                   : "r"(local_amax_reg), "r"(temp_amax_reg));
-    }
-    
-    if (kReturnIdentity && output_identity_ptr != nullptr) {
-      uint64_t global_offset = global_row_offset * output_stride + global_col_offset;
-      void* output_addr = reinterpret_cast<void*>(output_identity_ptr + global_offset);
-      store_matrix_16x16_to_global<false>(c_frag[0], c_frag[1], c_frag[2], c_frag[3],
-                                          output_addr, output_stride);
-    }
+    asm volatile("max.xorsign.abs.bf16x2 %0, %1, %2;\n\t"
+                 : "=r"(local_amax_reg)
+                 : "r"(local_amax_reg), "r"(temp_amax_reg));
   }
 
   if (kReturnTransposedAmax || kReturnTransposed) {
     // TODO(Frank): This is not efficient, since we could directly load the
     // matrix in transposed layout.
-    if (!kReturnIdentityAmax && !kReturnIdentity) {
+    if (!kReturnIdentityAmax) {
       ldmatrix_x4_m8n8_shared_b16<false>(a_frag[0], a_frag[1], a_frag[2], a_frag[3],
                                          reinterpret_cast<uint4*>(in_sh_ptr) + swizzle_idx);
     }
@@ -275,7 +264,7 @@ __device__ __forceinline__ void ComputeKernel(uint32_t b_frag_i[4], uint32_t b_f
   }
 
   if (kReturnPreRhtAmax) {
-    if (!kReturnIdentityAmax && !kReturnTransposedAmax && !kReturnIdentity && !kReturnTransposed) {
+    if (!kReturnIdentityAmax && !kReturnTransposedAmax && !kReturnTransposed) {
       ldmatrix_x4_m8n8_shared_b16<false>(a_frag[0], a_frag[1], a_frag[2], a_frag[3],
                                          reinterpret_cast<uint4*>(in_sh_ptr) + swizzle_idx);
     }
@@ -377,13 +366,11 @@ __launch_bounds__(1) __global__ void ZeroAmaxKernel(float* __restrict__ output_p
 
 template <typename IType, int kHadamardDimension, int CHUNK_DIM_Y, int CHUNK_DIM_X, int BUFF_DIM_Y,
           int BUFF_DIM_X, int THREADS_PER_CHUNK, int THREADS_PER_Y, bool kReturnPreRhtAmax,
-          bool kReturnIdentityAmax, bool kReturnTransposedAmax, bool kReturnIdentity,
-          bool kReturnTransposed>
+          bool kReturnIdentityAmax, bool kReturnTransposedAmax, bool kReturnTransposed>
 __global__ void HadamardAmaxTmaKernel(const __grid_constant__ CUtensorMap tensor_map_input,
                                       float* __restrict__ output_pre_rht_amax_ptr,
                                       float* __restrict__ output_identity_amax_ptr,
                                       float* __restrict__ output_transpose_amax_ptr,
-                                      IType* __restrict__ output_identity_ptr,
                                       IType* __restrict__ output_transpose_ptr,
                                       uint16_t random_sign_mask, uint16_t random_sign_mask_t,
                                       uint64_t num_rows, uint64_t row_length) {
@@ -495,13 +482,12 @@ __global__ void HadamardAmaxTmaKernel(const __grid_constant__ CUtensorMap tensor
                                       (compute_stage_x * kHadamardDimension * (THREADS_PER_CHUNK / kThreadsPerWarp));
           
           ComputeKernel<IType, kHadamardDimension, BUFF_DIM_Y, BUFF_DIM_X, kReturnPreRhtAmax,
-                        kReturnIdentityAmax, kReturnTransposedAmax, kReturnIdentity,
-                        kReturnTransposed>(
+                        kReturnIdentityAmax, kReturnTransposedAmax, kReturnTransposed>(
               had_frag_i, had_frag_t,
               in_sh_ptr + in_row_offset +
                   (compute_stage_x * kHadamardDimension * (THREADS_PER_CHUNK / kThreadsPerWarp)),
               local_pre_rht_amax_reg, local_amax_reg, local_amax_t_reg,
-              output_identity_ptr, output_transpose_ptr, row_length,
+              output_transpose_ptr, row_length,
               global_row, global_col);
         }
 
@@ -797,17 +783,15 @@ void hadamard_transform_amax(const Tensor& input_, Tensor& output_, uint16_t ran
   SimpleTensor& output_transpose_amax = output_.columnwise_amax;
 
   // Check data output tensors
-  SimpleTensor& output_identity = output_.data;
   SimpleTensor& output_transpose = output_.columnwise_data;
 
   // Check requested outputs
   const bool return_pre_rht_amax = output_pre_rht_amax.dptr != nullptr;
   const bool return_identity_amax = output_identity_amax.dptr != nullptr;
   const bool return_transposed_amax = output_transpose_amax.dptr != nullptr;
-  const bool return_identity = output_identity.dptr != nullptr;
   const bool return_transposed = output_transpose.dptr != nullptr;
   if (!return_identity_amax && !return_transposed_amax &&
-      !return_pre_rht_amax && !return_identity && !return_transposed) {  // Nothing to do/ill-defined behavior.
+      !return_pre_rht_amax && !return_transposed) {  // Nothing to do/ill-defined behavior.
     return;
   }
 
@@ -873,31 +857,27 @@ void hadamard_transform_amax(const Tensor& input_, Tensor& output_, uint16_t ran
               TRANSFORMER_ENGINE_SWITCH_CONDITION(
                   return_transposed, kReturnTransposed,
 
-                  TRANSFORMER_ENGINE_SWITCH_CONDITION(
-                      return_identity, kReturnIdentity,
+                  // *2 for ping-pong
+                  size_t in_sh_size = kBuffDimX * kBuffDimY * 2 * sizeof(IType);
+                  size_t mbar_size = sizeof(uint64_t) * (kChunkBlockXSmall / kBuffDimX) *
+                                     (kChunkBlockYSmall / kBuffDimY);
+                  size_t shmem_bytes = in_sh_size + mbar_size + kNumWarps * sizeof(float) * 3;
+                  // Add padding in case shmem ptr is not aligned to 128 bytes.
+                  shmem_bytes = (shmem_bytes + 128);
 
-                      // *2 for ping-pong
-                      size_t in_sh_size = kBuffDimX * kBuffDimY * 2 * sizeof(IType);
-                      size_t mbar_size = sizeof(uint64_t) * (kChunkBlockXSmall / kBuffDimX) *
-                                         (kChunkBlockYSmall / kBuffDimY);
-                      size_t shmem_bytes = in_sh_size + mbar_size + kNumWarps * sizeof(float) * 3;
-                      // Add padding in case shmem ptr is not aligned to 128 bytes.
-                      shmem_bytes = (shmem_bytes + 128);
+                  auto kernel = HadamardAmaxTmaKernel<
+                      IType, kHadamardDimension, kChunkBlockYSmall, kChunkBlockXSmall, kBuffDimY,
+                      kBuffDimX, kThreadBlockX * kThreadsPerWarp, kThreadBlockY, kReturnPreRhtAmax,
+                      kReturnIdentityAmax, kReturnTransposedAmax, kReturnTransposed>;
+                  cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                       shmem_bytes);
 
-                      auto kernel = HadamardAmaxTmaKernel<
-                          IType, kHadamardDimension, kChunkBlockYSmall, kChunkBlockXSmall, kBuffDimY,
-                          kBuffDimX, kThreadBlockX * kThreadsPerWarp, kThreadBlockY, kReturnPreRhtAmax,
-                          kReturnIdentityAmax, kReturnTransposedAmax, kReturnIdentity, kReturnTransposed>;
-                      cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                           shmem_bytes);
-
-                      kernel<<<grid, block, shmem_bytes, stream>>>(
-                          tensor_map_input, reinterpret_cast<float*>(output_pre_rht_amax.dptr),
-                          reinterpret_cast<float*>(output_identity_amax.dptr),
-                          reinterpret_cast<float*>(output_transpose_amax.dptr),
-                          reinterpret_cast<IType*>(output_identity.dptr),
-                          reinterpret_cast<IType*>(output_transpose.dptr),
-                          random_sign_mask, random_sign_mask_t, num_rows, row_length););););););
+                  kernel<<<grid, block, shmem_bytes, stream>>>(
+                      tensor_map_input, reinterpret_cast<float*>(output_pre_rht_amax.dptr),
+                      reinterpret_cast<float*>(output_identity_amax.dptr),
+                      reinterpret_cast<float*>(output_transpose_amax.dptr),
+                      reinterpret_cast<IType*>(output_transpose.dptr),
+                      random_sign_mask, random_sign_mask_t, num_rows, row_length);););););
 
   NVTE_CHECK_CUDA(cudaGetLastError());
 #else
